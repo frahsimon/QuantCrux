@@ -1,0 +1,338 @@
+import yfinance as yf
+import polars as pl
+import pandas as pd
+import toraniko.styles
+import toraniko.model
+import requests
+from toraniko.utils import fill_features
+import matplotlib.pyplot as plt
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+class RiskModel:
+    """
+    A wrapper for integrating financial data, computing factor scores,
+    and estimating factor returns using Toraniko.
+    """
+    def __init__(self):
+        self.tickers = list
+        self.df_prices = pl.DataFrame()
+        self.df_returns = pl.DataFrame()
+        self.df_input = pl.DataFrame()
+        self.df_factor_returns = pl.DataFrame()
+        self.df_residual_returns = pl.DataFrame()
+
+        self._display_banner()
+
+    @staticmethod
+    def _display_banner():
+        """
+        Display an ASCII art banner for the wrapper.
+        """
+        banner = r"""
+                
+
+                     ██████╗ ██╗   ██╗ █████╗ ███╗   ██╗████████╗ ██████╗██████╗ ██╗   ██╗██╗  ██╗
+                    ██╔═══██╗██║   ██║██╔══██╗████╗  ██║╚══██╔══╝██╔════╝██╔══██╗██║   ██║╚██╗██╔╝
+                    ██║   ██║██║   ██║███████║██╔██╗ ██║   ██║   ██║     ██████╔╝██║   ██║ ╚███╔╝ 
+                    ██║▄▄ ██║██║   ██║██╔══██║██║╚██╗██║   ██║   ██║     ██╔══██╗██║   ██║ ██╔██╗ 
+                    ╚██████╔╝╚██████╔╝██║  ██║██║ ╚████║   ██║   ╚██████╗██║  ██║╚██████╔╝██╔╝ ██╗
+                     ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝
+                     
+                                    Welcome to QuantCrux – A Wrapper for Toraniko
+                                                                                                  
+                """
+
+        print(banner)  # Or print directly
+
+    def _retrieve_dax_tickers(self) -> None:
+        """
+        Scrapes the DAX 40 tickers from Wikipedia and stores them in `self.tickers`.
+        """
+        url = "https://en.wikipedia.org/wiki/DAX"
+        response = requests.get(url)
+        dax_table = pd.read_html(response.text)[4]
+        self.tickers = dax_table['Ticker'].tolist()
+        self.tickers = [ticker for ticker in self.tickers if isinstance(ticker, str) and ticker.strip()]
+        if not self.tickers:
+            logger.error("No valid tickers found in the provided list.")
+            raise ValueError("No valid tickers found in the provided list.")
+        logger.info(f"Retrieved {len(self.tickers)} DAX tickers.")
+
+    def _fetch_price_data(self, tickers: list[str], start_date: str, end_date: str) -> None:
+        """
+        Fetch adjusted close price data for the given tickers and time range.
+        """
+        try:
+            data = yf.download(tickers, start=start_date, end=end_date, auto_adjust=True)
+            if data.empty:
+                logger.error(f"No data available for tickers: {tickers}.")
+                raise ValueError(f"No data available for tickers: {tickers}.")
+            data = pl.from_pandas(data.reset_index())
+            close_columns = [col for col in data.columns if "Close" in col]
+            self.df_prices = data.select(["('Date', '')"] + close_columns).rename(
+                dict(zip(["('Date', '')"] + close_columns, ["date"] + [col.split(", ")[1].strip("')") for col in close_columns]))
+            )
+            logger.info("Price data successfully fetched.")
+        except Exception as e:
+            logger.error(f"Failed to fetch price data: {e}")
+            raise
+
+    def _convert_to_symbol_returns(self, df_prices: pl.DataFrame) -> None:
+        """
+        Calculate daily percentage returns and reshape to long format.
+        """
+        try:
+            symbol_columns = [col for col in df_prices.columns if col != "date"]
+            returns_data = df_prices.select(
+                [((df_prices[col].shift(-1) / df_prices[col]) - 1).alias(col) for col in symbol_columns]
+            )
+            self.df_returns = returns_data.with_columns(
+                df_prices["date"].shift(-1).alias("date")
+            ).slice(0, returns_data.height - 1).unpivot(index=["date"], variable_name="symbol",
+                                                        value_name="asset_returns").with_columns(
+                pl.col("asset_returns").fill_null(0)
+            )
+            logger.info("Symbol returns successfully converted.")
+        except Exception as e:
+            logger.error(f"Failed to convert symbol returns: {e}")
+            raise
+
+    def _fetch_fundamental_data(self, tickers: list[str], start: str, end: str) -> None:
+        """
+        Retrieve and preprocess fundamental data, forward-fill missing values, and compute price ratios.
+        """
+        fundamentals = []
+
+        for ticker in tickers:
+            try:
+                stock = yf.Ticker(ticker)
+                history = stock.history(start=start, end=end)
+                market_cap = history["Close"] * stock.info.get("sharesOutstanding", None)
+
+                fundamentals_df = pd.DataFrame({
+                    "date": history.index,
+                    "symbol": ticker,
+                    "market_cap": market_cap,
+                    "book_value": stock.info.get("bookValue", None) * 1e6,
+                    "revenue": stock.info.get("totalRevenue", None),
+                    "cash_flow": stock.info.get("operatingCashflow", None),
+                })
+
+                pl_fundamentals = pl.from_pandas(fundamentals_df)
+                pl_fundamentals = pl_fundamentals.with_columns(
+                    pl.col("date").cast(pl.Date)
+                )
+
+                pl_fundamentals = fill_features(
+                    pl_fundamentals,
+                    features=("book_value", "revenue", "cash_flow"),
+                    sort_col="date",
+                    over_col="symbol"
+                )
+
+                pl_fundamentals = pl_fundamentals.with_columns([
+                    (pl.col("book_value") / pl.col("market_cap")).alias("book_price"),
+                    (pl.col("revenue") / pl.col("market_cap")).alias("sales_price"),
+                    (pl.col("cash_flow") / pl.col("market_cap")).alias("cf_price")
+                ])
+
+                pl_fundamentals = pl_fundamentals.select(["date", "symbol", "market_cap", "book_price", "sales_price", "cf_price"])
+
+                fundamentals.append(pl_fundamentals.collect())
+            except Exception as e:
+                logger.warning(f"Failed to fetch fundamentals for {ticker}: {e}")
+                raise
+
+        if fundamentals:
+            self.df_fundamentals = pl.concat(fundamentals)
+            logger.info("Fundamental data successfully fetched.")
+        else:
+            logger.error("No fundamental data fetched.")
+            self.df_fundamentals = pl.DataFrame()
+
+    def _fetch_gics_data(self, tickers: list[str]) -> None:
+        """
+        Retrieve GICS (sector classification) data and one-hot encode sectors.
+        """
+        gics_data = []
+
+        for ticker in tickers:
+            try:
+                stock = yf.Ticker(ticker)
+                gics_data.append({"symbol": ticker, "Sector": stock.info.get("sector", None)})
+            except Exception as e:
+                logger.warning(f"Failed to fetch GICS data for {ticker}: {e}")
+                raise
+
+        gics_df = pd.DataFrame(gics_data)
+        gics_dummy_df = pd.get_dummies(gics_df, columns=["Sector"], prefix="", prefix_sep="")
+        sector_columns = [col for col in gics_dummy_df.columns if col != "symbol"]
+        gics_dummy_df[sector_columns] = gics_dummy_df[sector_columns].astype(int)
+        self.df_gics_dummy = pl.from_pandas(gics_dummy_df)
+        logger.info("GICS data successfully fetched.")
+
+    def _merge_input_data(self) -> None:
+        """
+        Merge returns, fundamentals, and GICS data into a unified dataset.
+        """
+        if self.df_returns.is_empty() or self.df_fundamentals.is_empty() or self.df_gics_dummy.is_empty():
+            logger.error("Return data, fundamental data, or GICS data is missing.")
+            raise ValueError("Return data, fundamental data, or GICS data is missing.")
+
+        try:
+            self.df_returns = self.df_returns.with_columns(
+                pl.col("date").cast(pl.Date)
+            )
+            self.df_fundamentals = self.df_fundamentals.with_columns(
+                pl.col("date").cast(pl.Date)
+            )
+            self.df_input = self.df_returns.join(
+                self.df_fundamentals,
+                on=["date", "symbol"],
+                how="inner"
+            ).join(
+                self.df_gics_dummy.with_columns(pl.col("symbol").str.strip_chars("'\"")),
+                on="symbol",
+                how="inner"
+            )
+            logger.info("Input data successfully merged.")
+        except Exception as e:
+            logger.error(f"Failed to merge input data: {e}")
+            raise
+
+    def construct_input(self, index: str, start_date: str, end_date: str) -> None:
+        """
+        Construct the input dataset by retrieving and merging data.
+        """
+        if index == "DAX40":
+            self._retrieve_dax_tickers()
+        else:
+            # to be implemented
+            pass
+        self._fetch_price_data(self.tickers, start_date, end_date)
+        self._convert_to_symbol_returns(self.df_prices)
+        self._fetch_fundamental_data(self.tickers, start_date, end_date)
+        self._fetch_gics_data(self.tickers)
+        self._merge_input_data()
+
+    def compute_factor_scores(
+            self,
+            factors: list[str],
+            trailing_days: int = 252,
+            winsor_factor: float = 0.05,
+            lower_decile: float = 0.2,
+            upper_decile: float = 0.8
+    ) -> None:
+        """
+        Compute factor scores for the dataset.
+        """
+        factor_scores = []
+
+        if "mom" in factors:
+            mom_df = toraniko.styles.factor_mom(
+                self.df_input.select("date", "symbol", "asset_returns"),
+                trailing_days=trailing_days,
+                winsor_factor=winsor_factor
+            ).collect()
+            factor_scores.append(mom_df)
+
+        if "val" in factors:
+            val_df = toraniko.styles.factor_val(
+                self.df_input.select("date", "symbol", "book_price", "sales_price", "cf_price")
+            ).collect()
+            factor_scores.append(val_df)
+
+        if "sze" in factors:
+            sze_df = toraniko.styles.factor_sze(
+                self.df_input.select("date", "symbol", "market_cap"),
+                lower_decile=lower_decile,
+                upper_decile=upper_decile
+            ).collect()
+            factor_scores.append(sze_df)
+
+        for i in range(1, len(factor_scores)):
+            factor_scores[i] = factor_scores[i].select(pl.exclude(["date", "symbol"]))
+
+        if factor_scores:
+            self.df_factor_scores = pl.concat(factor_scores, how="horizontal")
+        else:
+            raise ValueError("No valid factors provided. Choose from ['mom', 'val', 'sze'].")
+
+    def compute_factor_returns(self) -> None:
+        """
+        Estimate factor returns using the unified dataset.
+        """
+        df_input_final = (
+            self.df_input
+            .join(self.df_factor_scores, on=["date", "symbol"], how="inner")
+            .drop_nulls()
+            .filter(~pl.any_horizontal(pl.exclude(["date", "symbol"]).is_nan()))
+        )
+
+        self.df_factor_returns, self.df_residual_returns = toraniko.model.estimate_factor_returns(
+            df_input_final.select("date", "symbol", "asset_returns"),
+            df_input_final.select("date", "symbol", "market_cap"),
+            df_input_final.select(["date"] + self.df_gics_dummy.columns),
+            df_input_final.select(self.df_factor_scores.columns),
+            winsor_factor=0.1,
+            residualize_styles=True
+        )
+
+
+def plot_histograms(df, factors, title_prefix):
+    """Plot histograms for factor scores."""
+    for factor in factors:
+        plt.figure(figsize=(8, 6))
+        plt.hist(df[f"{factor}_score"], bins=50, edgecolor="black", alpha=0.7)
+        plt.xlabel(f"{factor}_score")
+        plt.ylabel("Frequency")
+        plt.title(f"{title_prefix}: {factor}_score")
+        plt.grid(axis="y", linestyle="--", alpha=0.7)
+        plt.show()
+
+
+def plot_cumulative_returns(factor_df, factors, title_prefix):
+    """Plot cumulative returns for factors."""
+    factor_df["date"] = pd.to_datetime(factor_df["date"])
+    for factor in factors:
+        factor_df[f"cumulative_{factor}"] = (1 + factor_df[f"{factor}_score"]).cumprod() - 1
+        plt.figure(figsize=(10, 6))
+        plt.plot(factor_df["date"], factor_df[f"cumulative_{factor}"], label=f"{factor.capitalize()} Factor")
+        plt.xlabel("Date")
+        plt.ylabel("Cumulative Return")
+        plt.title(f"{title_prefix}: {factor.capitalize()} Factor")
+        plt.legend()
+        plt.grid(axis="y", linestyle="--", alpha=0.7)
+        plt.show()
+
+
+if __name__ == "__main__":
+    start_date = "2015-12-31"
+    end_date = "2024-12-31"
+    factors = ["val"]
+
+    # Initialize and process data
+    factor_model = RiskModel()
+    factor_model.construct_input("DAX40", start_date, end_date)
+    factor_model.compute_factor_scores(factors)
+    factor_model.compute_factor_returns()
+
+    # Visualize results
+    if not factor_model.df_factor_scores.is_empty():
+        plot_histograms(
+            factor_model.df_factor_scores.to_pandas(),
+            factors,
+            "Distribution"
+        )
+    else:
+        print("Fundamental data is missing or empty.")
+
+    plot_cumulative_returns(
+        factor_model.df_factor_returns.to_pandas(),
+        factors,
+        "Cumulative Return"
+    )
